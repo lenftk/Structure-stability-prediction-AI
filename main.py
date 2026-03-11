@@ -16,7 +16,7 @@ from sklearn.model_selection import StratifiedKFold
 class CFG:
     SEED = 42
     IMG_SIZE = 384               
-    BATCH_SIZE = 16              
+    BATCH_SIZE = 8            
     EPOCHS = 15
     LR = 1e-4
     WEIGHT_DECAY = 1e-2
