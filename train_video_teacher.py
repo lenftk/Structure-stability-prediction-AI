@@ -32,18 +32,11 @@ def seed_everything(seed):
 seed_everything(CFG.SEED)
 class VideoStructureDataset(Dataset):
     def __init__(self, df, img_dir='train'):
-        """
-        비디오만 처리하는 Dataset. test/dev에는 비디오가 없으므로 오직 train 대해서만 구동 가능합니다.
-        (이 모델은 미래에 Teacher 모델 혹은 Multi-modal을 위한 뼈대로 사용됩니다.)
-        """
         self.df = df
         self.img_dir = img_dir
     def __len__(self):
         return len(self.df)
     def extract_frames(self, video_path, num_frames=CFG.NUM_FRAMES):
-        """
-        10초 분량의 영상에서 균일한 간격으로 num_frames장의 프레임을 추출합니다.
-        """
         cap = cv2.VideoCapture(video_path)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if frame_count == 0:
@@ -138,18 +131,21 @@ def train_teacher_model(fold, train_loader, val_loader, device):
             best_val_loss = _val_loss
             best_weights = model.state_dict().copy()
             torch.save(best_weights, f'teacher_model_fold{fold}.pth')
-            print(f"  --> ⭐ Best Teacher Model Saved (Val Loss: {best_val_loss:.4f})")
+            print(f"  --> Best Teacher Model Saved (Val Loss: {best_val_loss:.4f})")
     return best_weights
 if __name__ == '__main__':
-    train_df_all = pd.read_csv('train.csv')
+    train_df_all = pd.read_csv('open/train.csv')
     skf = StratifiedKFold(n_splits=CFG.N_FOLDS, shuffle=True, random_state=CFG.SEED)
     targets = (train_df_all['label'] == 'unstable').astype(int)
+    
     for fold, (train_idx, val_idx) in enumerate(skf.split(train_df_all, targets), 1):
         fold_train = train_df_all.iloc[train_idx].reset_index(drop=True)
         fold_val = train_df_all.iloc[val_idx].reset_index(drop=True)
-        train_dataset = VideoStructureDataset(fold_train, img_dir='train')
-        val_dataset = VideoStructureDataset(fold_val, img_dir='train')
+        
+        train_dataset = VideoStructureDataset(fold_train, img_dir='open/train')
+        val_dataset = VideoStructureDataset(fold_val, img_dir='open/train')
+        
         train_loader = DataLoader(train_dataset, batch_size=CFG.BATCH_SIZE, shuffle=True, num_workers=CFG.NUM_WORKERS)
         val_loader = DataLoader(val_dataset, batch_size=CFG.BATCH_SIZE, shuffle=False, num_workers=CFG.NUM_WORKERS)
         train_teacher_model(fold, train_loader, val_loader, CFG.DEVICE)
-    print("✅ Teacher 모델 K-Fold 학습이 완료되었습니다. (추후 Knowledge Distillation에 활용)")
+    print("Teacher 모델 K-Fold 학습이 완료되었습니다. (추후 Knowledge Distillation에 활용)")

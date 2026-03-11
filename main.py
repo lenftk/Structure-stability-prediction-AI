@@ -50,8 +50,8 @@ train_transform = A.Compose([
     A.Resize(CFG.IMG_SIZE, CFG.IMG_SIZE),
     A.HorizontalFlip(p=0.5),
     A.RandomBrightnessContrast(p=0.5),
-    A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
-    A.CoarseDropout(max_holes=8, max_height=int(CFG.IMG_SIZE*0.1), max_width=int(CFG.IMG_SIZE*0.1), p=0.3),
+    A.Affine(scale=(0.95, 1.05), translate_percent=(-0.05, 0.05), rotate=(-15, 15), p=0.5),
+    A.CoarseDropout(num_holes_range=(1, 8), hole_height_range=(1, int(CFG.IMG_SIZE*0.1)), hole_width_range=(1, int(CFG.IMG_SIZE*0.1)), p=0.3),
     A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ToTensorV2()
 ])
@@ -157,7 +157,7 @@ def train_one_fold(fold, train_loader, val_loader, device):
             best_val_loss = _val_loss
             best_model_weights = model.state_dict().copy()
             torch.save(best_model_weights, f'best_model_fold{fold}.pth')
-            print(f"  --> ⭐ Best Model Saved! (Val Loss: {best_val_loss:.4f})")
+            print(f"  --> Best Model Saved! (Val Loss: {best_val_loss:.4f})")
     model.load_state_dict(best_model_weights)
     return model
 def inference_ensemble(models, test_loader, device):
@@ -178,19 +178,20 @@ def inference_ensemble(models, test_loader, device):
     return ensemble_probs
 if __name__ == '__main__':
     print(f"Using Device: {CFG.DEVICE}")
-    train_df = pd.read_csv('train.csv')  
-    dev_df = pd.read_csv('dev.csv')
-    test_df = pd.read_csv('test.csv')
-    submit = pd.read_csv('sample_submission.csv')
-    train_df['img_dir'] = 'train'
-    dev_df['img_dir'] = 'dev'
-    test_df['img_dir'] = 'test'
+    train_df = pd.read_csv('open/train.csv')  
+    dev_df = pd.read_csv('open/dev.csv')
+    submit = pd.read_csv('open/sample_submission.csv')
+    test_df = submit[['id']].copy()
+    
+    train_df['img_dir'] = 'open/train'
+    dev_df['img_dir'] = 'open/dev'
+    test_df['img_dir'] = 'open/test'
     merged_df = pd.concat([train_df, dev_df], axis=0).reset_index(drop=True)
     test_dataset = StructureDataset(test_df, transform=test_transform, is_test=True)
     test_loader = DataLoader(test_dataset, batch_size=CFG.BATCH_SIZE, shuffle=False, num_workers=CFG.NUM_WORKERS)
     skf = StratifiedKFold(n_splits=CFG.N_FOLDS, shuffle=True, random_state=CFG.SEED)
     trained_models = []
-    print("🚀 Start K-Fold Training...")
+    print("Start K-Fold Training...")
     targets = (merged_df['label'] == 'unstable').astype(int)
     for fold, (train_idx, val_idx) in enumerate(skf.split(merged_df, targets), 1):
         fold_train_df = merged_df.iloc[train_idx].reset_index(drop=True)
