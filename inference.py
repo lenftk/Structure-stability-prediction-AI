@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from dataset import StructureDataset
 from model import StructureStabilityModel
+from model_advanced import AdvancedStructureModel
 from tqdm import tqdm
 
 def get_args():
@@ -13,6 +14,7 @@ def get_args():
     parser.add_argument("--data_dir", type=str, default="open", help="Path to open dataset directory")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--backbone", type=str, default="resnet34", help="Model backbone")
+    parser.add_argument("--advanced", action="store_true", help="Use Advanced Model architecture")
     parser.add_argument("--weights_path", type=str, required=True, help="Path to best model weights")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output_file", type=str, default="submission.csv", help="Submission CSV filename")
@@ -31,7 +33,11 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     
     # Model
-    model = StructureStabilityModel(backbone_name=args.backbone, pretrained=False)
+    if args.advanced:
+        model = AdvancedStructureModel(backbone_name=args.backbone, pretrained=False)
+    else:
+        model = StructureStabilityModel(backbone_name=args.backbone, pretrained=False)
+        
     model.load_state_dict(torch.load(args.weights_path, map_location=args.device))
     model.to(args.device)
     model.eval()
