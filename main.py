@@ -147,7 +147,7 @@ def train_one_fold(fold, train_loader, val_loader, device):
     criterion = DistillationLoss(use_soft_label=True).to(device)
     
     best_val_loss = float('inf')
-    best_model_weights = None
+    best_model_weights = model.state_dict().copy()  # NoneType 에러 방지를 위한 초기 가중치 백업
 
     for epoch in range(1, CFG.EPOCHS + 1):
         model.train()
