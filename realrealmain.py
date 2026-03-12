@@ -16,13 +16,10 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# ==============================================================================
-# 1. 하이퍼파라미터 셋팅 (버그 픽스 및 최적화)
-# ==============================================================================
 class CFG:
     DATA_DIR = './open'
-    MODEL_NAME = 'convnext_small_in22ft1k' 
-    IMG_SIZE = 224
+    MODEL_NAME = 'tf_efficientnetv2_s.in21k_ft_in1k' 
+    IMG_SIZE = 256
     BATCH_SIZE = 16
     EPOCHS = 15
     MAX_LR = 2e-4
@@ -30,7 +27,7 @@ class CFG:
     NUM_FOLDS = 5
     MIXUP_PROB = 0.3
     MIXUP_CUTOFF_EPOCH = 10 
-    MIXUP_ALPHA = 0.2             # [수정 1] 치명적 버그 픽스 (누락된 변수 추가)
+    MIXUP_ALPHA = 0.2             
     EMA_DECAY = 0.999
     SAM_RHO = 0.05
     LABEL_SMOOTHING = 0.05
@@ -45,9 +42,6 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = True
 seed_everything(CFG.SEED)
 
-# ==============================================================================
-# 2. SAM Optimizer (유지)
-# ==============================================================================
 class SAM(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer, rho=0.05, **kwargs):
         assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
@@ -83,9 +77,6 @@ class SAM(torch.optim.Optimizer):
         return torch.norm(
             torch.stack([p.grad.norm(p=2).to(shared_device) for group in self.param_groups for p in group["params"] if p.grad is not None]), p=2)
 
-# ==============================================================================
-# 3. 데이터셋 및 물리 제약 분리 증강 (유지)
-# ==============================================================================
 front_transform = A.Compose([
     A.Resize(CFG.IMG_SIZE, CFG.IMG_SIZE),
     A.HorizontalFlip(p=0.5), 
@@ -142,9 +133,6 @@ class StructureDataset(Dataset):
             label = 1.0 - smooth if row['label'] == 'stable' else 0.0 + smooth
             return front_img, top_img, torch.tensor(label, dtype=torch.float32)
 
-# ==============================================================================
-# 4. 모델 설계 [방어 코드 및 메모리 캡(Cap) 적용]
-# ==============================================================================
 class BulletproofCrossAttentionNet(nn.Module):
     def __init__(self, model_name=CFG.MODEL_NAME):
         super().__init__()
@@ -154,13 +142,11 @@ class BulletproofCrossAttentionNet(nn.Module):
             dummy = torch.randn(1, 3, CFG.IMG_SIZE, CFG.IMG_SIZE)
             feat_map = self.backbone.forward_features(dummy)
             
-            # [수정 2] Channels Last (B, H, W, C) 방어 코드
             if feat_map.shape[1] < feat_map.shape[-1]:
                 self.feat_dim = feat_map.shape[-1]
             else:
                 self.feat_dim = feat_map.shape[1]
                 
-        # [수정 3] 해상도가 커져도 Attention 메모리가 폭발하지 않도록 7x7 (Seq=49)로 강제 고정!
         self.safe_pool = nn.AdaptiveAvgPool2d((7, 7))
         
         self.cross_attn = nn.MultiheadAttention(embed_dim=self.feat_dim, num_heads=8, batch_first=True)
@@ -178,20 +164,16 @@ class BulletproofCrossAttentionNet(nn.Module):
         f_map = self.backbone.forward_features(front)
         t_map = self.backbone.forward_features(top)
         
-        # Channels Last 형태라면 (B, C, H, W)로 강제 변환
         if f_map.shape[-1] == self.feat_dim:
             f_map = f_map.permute(0, 3, 1, 2)
             t_map = t_map.permute(0, 3, 1, 2)
             
-        # Attention 복잡도 O(N^2) 메모리 폭발 방지를 위한 Adaptive Pooling (7x7 보장)
         f_map = self.safe_pool(f_map)
         t_map = self.safe_pool(t_map)
         
-        # Sequence 변환: (B, C, 7, 7) -> (B, 49, C)
         f_seq = f_map.flatten(2).transpose(1, 2)
         t_seq = t_map.flatten(2).transpose(1, 2)
         
-        # True Spatial Cross Attention
         attn_out, _ = self.cross_attn(query=f_seq, key=t_seq, value=t_seq)
         
         f_pooled = f_seq.mean(dim=1)
@@ -211,9 +193,6 @@ def mixup_data(front, top, y, alpha=CFG.MIXUP_ALPHA):
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
-# ==============================================================================
-# 5. K-Fold 학습 루프 (안정성 극대화)
-# ==============================================================================
 def train_and_evaluate():
     train_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'train.csv'))
     dev_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'dev.csv'))
@@ -238,12 +217,10 @@ def train_and_evaluate():
         num_stable = len(trn_df[trn_df['label'] == 'stable'])
         num_unstable = len(trn_df[trn_df['label'] == 'unstable'])
         
-        # [수정 4] pos_weight 폭주 방지 (최대 3.0으로 클리핑)
         calc_pos_weight = min(num_unstable / (num_stable + 1e-6), 3.0) 
         pos_weight = torch.tensor([calc_pos_weight], dtype=torch.float32).to(CFG.DEVICE)
         print(f"[*] Clamped pos_weight for BCE: {calc_pos_weight:.4f}")
         
-        # [수정 5] 데이터 로더 병목 및 크래시 방지 (num_workers=2, pin_memory 추가)
         train_loader = DataLoader(StructureDataset(trn_df, is_train=True), batch_size=CFG.BATCH_SIZE, shuffle=True, 
                                   num_workers=2, pin_memory=True, persistent_workers=True, drop_last=True)
         val_loader = DataLoader(StructureDataset(val_df, is_train=False), batch_size=CFG.BATCH_SIZE, shuffle=False, 
@@ -311,18 +288,13 @@ def train_and_evaluate():
             
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                # [수정 6] 가장 안정적인 EMA 모델의 가중치를 저장하여 Inference에 사용!
                 torch.save(ema_model.module.state_dict(), f'best_model_fold{fold}.pth')
-                print(f"🔥 [NEW BEST] Fold {fold} Saved! Val Loss: {best_val_loss:.4f}")
+                print(f" [NEW BEST] Fold {fold} Saved! Val Loss: {best_val_loss:.4f}")
 
-# ==============================================================================
-# 6. Test 추론 (안전하고 빠른 TTA)
-# ==============================================================================
 def inference_ensemble():
     test_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'sample_submission.csv'))
     test_df['source'] = 'test'
     test_dataset = StructureDataset(test_df, is_train=False, is_test=True)
-    # Inference 시에는 persistent_workers=False 로 깔끔하게 종료
     test_loader = DataLoader(test_dataset, batch_size=CFG.BATCH_SIZE, shuffle=False, 
                              num_workers=2, pin_memory=True)
     
@@ -359,7 +331,7 @@ def inference_ensemble():
     submission['unstable_prob'] = 1.0 - stable_probs
     submission['stable_prob'] = stable_probs
     submission.to_csv('submission_v6_final.csv', index=False)
-    print("\n🚀 [FINAL] Saved as 'submission_v6_final.csv'")
+    print("\n [FINAL] Saved as 'submission_v6_final.csv'")
 
 if __name__ == '__main__':
     train_and_evaluate()
