@@ -33,7 +33,7 @@ class StructureDataset(Dataset):
             ])
         else:
             self.transform = A.Compose([
-                A.Resize(size=(224, 224)),
+                A.Resize(height=224, width=224),
                 A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                 ToTensorV2(),
             ])
