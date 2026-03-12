@@ -33,6 +33,32 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 seed_everything(CFG.SEED)
+# ==============================================================================
+# 성능 향상을 위한 Custom Loss: Knowledge Distillation Loss
+# 기존 BCE나 Focal Loss(0/1) 대신, Teacher의 Soft Label(예: 0.87)을 맞추는 Loss로 변경
+# ==============================================================================
+class DistillationLoss(nn.Module):
+    def __init__(self, use_soft_label=True):
+        super().__init__()
+        self.use_soft_label = use_soft_label
+        # Soft Label 학습에는 MSE(평균제곱오차)나 BCE 손실이 효율적입니다.
+        self.mse_criterion = nn.MSELoss()
+        
+        # 만약 Soft Label이 없는 검증 데이터(dev)의 경우 기존처럼 Focal Loss 사용
+        self.focal_criterion = FocalLoss()
+
+    def forward(self, logits, targets, soft_labels=None):
+        # 1. Soft Label(지식 증류) 값이 주어진 경우
+        if self.use_soft_label and soft_labels is not None:
+            # logits에 Sigmoid를 씌워 확률로 만든 뒤 Teacher의 확률값(soft_labels)과 L2 Loss 계산
+            student_probs = torch.sigmoid(logits)
+            loss = self.mse_criterion(student_probs, soft_labels)
+            return loss
+            
+        # 2. Soft Label이 없는 경우 (기존 일반 학습)
+        return self.focal_criterion(logits, targets)
+
+# (기존 Focal Loss는 fallback 용도로 유지)
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
         super().__init__()
@@ -81,8 +107,13 @@ class StructureDataset(Dataset):
         if self.is_test:
             return front_img, top_img, folder_id
         else:
+            # 기본 Target (0.0 or 1.0)
             label = 1.0 if row['label'] == 'unstable' else 0.0
-            return front_img, top_img, torch.tensor(label, dtype=torch.float32)
+            
+            # soft_unstable_prob (지식 증류 값이 있으면 가져오고, 없으면 -1.0(비활성)으로 설정)
+            soft_label = row.get('soft_unstable_prob', -1.0)
+            
+            return front_img, top_img, torch.tensor(label, dtype=torch.float32), torch.tensor(soft_label, dtype=torch.float32)
 class DualViewNet(nn.Module):
     def __init__(self, model_name=CFG.MODEL_NAME, pretrained=True):
         super(DualViewNet, self).__init__()
@@ -109,41 +140,62 @@ def train_one_fold(fold, train_loader, val_loader, device):
     print(f"\n========== Fold {fold} Training ==========")
     model = DualViewNet(model_name=CFG.MODEL_NAME, pretrained=True).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=CFG.LR, weight_decay=CFG.WEIGHT_DECAY)
+    # CosineAnnealingWarmRestarts: 학습 후반부에 정체되는 것을 막기 위함
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)
-    criterion = FocalLoss().to(device)
+    
+    # 지식 증류 Loss (Student(이미지)가 Teacher(비디오) 흉내내기)
+    criterion = DistillationLoss(use_soft_label=True).to(device)
+    
     best_val_loss = float('inf')
     best_model_weights = None
+
     for epoch in range(1, CFG.EPOCHS + 1):
         model.train()
         train_loss = []
         train_corrects = 0
         train_total = 0
-        for front_img, top_img, labels in tqdm(train_loader, desc=f'Epoch {epoch} Train', leave=False):
+        
+        for front_img, top_img, labels, soft_labels in tqdm(train_loader, desc=f'Epoch {epoch} Train', leave=False):
             front_img = front_img.to(device)
             top_img = top_img.to(device)
             labels = labels.to(device)
+            
+            # soft_label이 -1.0이면 None으로 처리, 있으면 tensor 반영
+            has_soft = (soft_labels[0] >= 0.0)
+            soft_labels = soft_labels.to(device) if has_soft else None
+            
             optimizer.zero_grad()
             logits = model(front_img, top_img)
-            loss = criterion(logits, labels)
+            
+            # 디스틸레이션 Loss (Soft Label 사용시 MSE, 미사용시 Focal 계싼)
+            loss = criterion(logits, labels, soft_labels)
             loss.backward()
             optimizer.step()
+            
             train_loss.append(loss.item())
+            
             preds = (torch.sigmoid(logits) > 0.5).float()
             train_corrects += (preds == labels).sum().item()
             train_total += labels.size(0)
+            
         _train_loss = np.mean(train_loss)
         _train_acc = train_corrects / train_total
+        
         model.eval()
         val_loss = []
         val_corrects = 0
         val_total = 0
+        
         with torch.no_grad():
-            for front_img, top_img, labels in tqdm(val_loader, desc=f'Epoch {epoch} Valid', leave=False):
+            for front_img, top_img, labels, soft_labels in tqdm(val_loader, desc=f'Epoch {epoch} Valid', leave=False):
                 front_img = front_img.to(device)
                 top_img = top_img.to(device)
                 labels = labels.to(device)
+                
+                # 검증시에는 무조건 일반적인 Focal Loss 혹은 이진 검증을 위한 형태로 계산
                 logits = model(front_img, top_img)
-                loss = criterion(logits, labels)
+                loss = DistillationLoss(use_soft_label=False).to(device)(logits, labels)
+                
                 val_loss.append(loss.item())
                 preds = (torch.sigmoid(logits) > 0.5).float()
                 val_corrects += (preds == labels).sum().item()
@@ -183,9 +235,24 @@ if __name__ == '__main__':
     submit = pd.read_csv('open/sample_submission.csv')
     test_df = submit[['id']].copy()
     
+    # 데이터 소스 디렉토리 세팅
     train_df['img_dir'] = 'open/train'
     dev_df['img_dir'] = 'open/dev'
     test_df['img_dir'] = 'open/test'
+    
+    # ======== [지식 증류 병합] ========
+    # 단계 1에서 추출한 'teacher_soft_labels.csv' 파일이 있다면 읽어와서 병합합니다.
+    soft_label_path = 'teacher_soft_labels.csv'
+    if os.path.exists(soft_label_path):
+        print(f"👉 발견됨: {soft_label_path} (Knowledge Distillation - Soft Label 학습을 시작합니다)")
+        teacher_df = pd.read_csv(soft_label_path)
+        # ID를 기준으로 train_df에 지식 증류 값을 합칩니다. (dev.csv에는 비디오가 없으므로 결측치 처리)
+        # 훈련 데이터에만 soft_unstable_prob 값이 들어가게 됩니다.
+        train_df = pd.merge(train_df, teacher_df[['id', 'soft_unstable_prob']], on='id', how='left')
+    else:
+        print("⚠️ 주의: teacher_soft_labels.csv 가 아직 없습니다. 일반(Hard Label) 학습으로 진행됩니다.")
+
+    # train과 dev 데이터 병합 (학습/검증용 전체 데이터 구성 - 일반성 극대화)
     merged_df = pd.concat([train_df, dev_df], axis=0).reset_index(drop=True)
     test_dataset = StructureDataset(test_df, transform=test_transform, is_test=True)
     test_loader = DataLoader(test_dataset, batch_size=CFG.BATCH_SIZE, shuffle=False, num_workers=CFG.NUM_WORKERS)
