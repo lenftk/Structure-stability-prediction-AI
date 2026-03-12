@@ -1,10 +1,2 @@
-torch
-torchvision
-torchaudio
-pandas
-numpy
-opencv-python
-tqdm
-albumentations
 timm
-
+albumentations
