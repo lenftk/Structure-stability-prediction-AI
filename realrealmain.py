@@ -22,9 +22,9 @@ warnings.filterwarnings('ignore')
 class CFG:
     DATA_DIR = './open'
     MODEL_NAME = 'convnext_small_in22ft1k' 
-    IMG_SIZE = 224
+    IMG_SIZE = 288
     BATCH_SIZE = 16
-    EPOCHS = 15
+    EPOCHS = 30
     MAX_LR = 2e-4
     WEIGHT_DECAY = 1e-2
     NUM_FOLDS = 5
