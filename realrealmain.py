@@ -18,10 +18,10 @@ warnings.filterwarnings('ignore')
 
 class CFG:
     DATA_DIR = './open'
-    MODEL_NAME = 'swinv2_tiny_window16_256' #convnext_small_in22ft1k!, tf_efficientnetv2_s.in21k_ft_in1k!, convnext_base_in22ft1k!, swinv2_tiny_window16_256, maxvit_tiny_tf_224.in1k
-    IMG_SIZE = 256
-    BATCH_SIZE = 16
-    EPOCHS = 30
+    MODEL_NAME = 'convnext_small_in22ft1k' #convnext_small_in22ft1k!, tf_efficientnetv2_s.in21k_ft_in1k!, convnext_base_in22ft1k??, swinv2_tiny_window16_256!, maxvit_tiny_tf_224.in1k
+    IMG_SIZE = 288
+    BATCH_SIZE = 64
+    EPOCHS = 60
     MAX_LR = 2e-4
     WEIGHT_DECAY = 1e-2
     NUM_FOLDS = 5
@@ -156,10 +156,10 @@ class RobustFusionNet(nn.Module):
         return self.classifier(combined).squeeze(1)
 
 def train_and_evaluate():
-    train_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'train.csv'))
+    train_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'train_pseudo.csv'))
     dev_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'dev.csv'))
     
-    train_df['source'] = 'train'
+    train_df['source'] = train_df['id'].apply(lambda x: str(x).split('_')[0].lower())
     dev_df['source'] = 'dev'
     all_df = pd.concat([train_df, dev_df], ignore_index=True)
     
