@@ -16,21 +16,20 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+# ==============================================================================
+# 1. 하이퍼파라미터 (기교 전부 제거, 순수 LogLoss 최적화)
+# ==============================================================================
 class CFG:
     DATA_DIR = './open'
-    MODEL_NAME = 'tf_efficientnetv2_s.in21k_ft_in1k' 
+    MODEL_NAME = 'convnext_small_in22ft1k' 
     IMG_SIZE = 224
     BATCH_SIZE = 16
     EPOCHS = 15
     MAX_LR = 2e-4
     WEIGHT_DECAY = 1e-2
     NUM_FOLDS = 5
-    MIXUP_PROB = 0.3
-    MIXUP_CUTOFF_EPOCH = 10 
-    MIXUP_ALPHA = 0.2             
     EMA_DECAY = 0.999
     SAM_RHO = 0.05
-    LABEL_SMOOTHING = 0.05
     SEED = 2026
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -42,6 +41,9 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = True
 seed_everything(CFG.SEED)
 
+# ==============================================================================
+# 2. SAM Optimizer (유지: 도메인 일반화에 필수)
+# ==============================================================================
 class SAM(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer, rho=0.05, **kwargs):
         assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
@@ -77,6 +79,9 @@ class SAM(torch.optim.Optimizer):
         return torch.norm(
             torch.stack([p.grad.norm(p=2).to(shared_device) for group in self.param_groups for p in group["params"] if p.grad is not None]), p=2)
 
+# ==============================================================================
+# 3. 데이터셋 및 증강 (순수 물리 제약 증강 유지)
+# ==============================================================================
 front_transform = A.Compose([
     A.Resize(CFG.IMG_SIZE, CFG.IMG_SIZE),
     A.HorizontalFlip(p=0.5), 
@@ -129,31 +134,27 @@ class StructureDataset(Dataset):
             
         if self.is_test: return front_img, top_img, img_id
         else:
-            smooth = CFG.LABEL_SMOOTHING
-            label = 1.0 - smooth if row['label'] == 'stable' else 0.0 + smooth
+            # 🚨 [수정 1] Label Smoothing 완벽 제거! LogLoss를 위해 순수 1.0과 0.0 부여
+            label = 1.0 if row['label'] == 'stable' else 0.0
             return front_img, top_img, torch.tensor(label, dtype=torch.float32)
 
-class BulletproofCrossAttentionNet(nn.Module):
+# ==============================================================================
+# 4. 모델 설계 (강력하고 심플한 Late Fusion Baseline)
+# ==============================================================================
+class RobustFusionNet(nn.Module):
     def __init__(self, model_name=CFG.MODEL_NAME):
         super().__init__()
+        # Cross Attention 제거. 기본 Global Average Pooling(num_classes=0) 사용
         self.backbone = timm.create_model(model_name, pretrained=True, num_classes=0)
         
         with torch.no_grad():
             dummy = torch.randn(1, 3, CFG.IMG_SIZE, CFG.IMG_SIZE)
-            feat_map = self.backbone.forward_features(dummy)
+            feat_dim = self.backbone(dummy).shape[1]
             
-            if feat_map.shape[1] < feat_map.shape[-1]:
-                self.feat_dim = feat_map.shape[-1]
-            else:
-                self.feat_dim = feat_map.shape[1]
-                
-        self.safe_pool = nn.AdaptiveAvgPool2d((7, 7))
-        
-        self.cross_attn = nn.MultiheadAttention(embed_dim=self.feat_dim, num_heads=8, batch_first=True)
-        
+        # (Front, Top, Front*Top) 3가지 조합 -> 차원 3배
         self.classifier = nn.Sequential(
             nn.Dropout(0.3),
-            nn.Linear(self.feat_dim * 3, 512),
+            nn.Linear(feat_dim * 3, 512),
             nn.GELU(),
             nn.LayerNorm(512),
             nn.Dropout(0.3),
@@ -161,38 +162,20 @@ class BulletproofCrossAttentionNet(nn.Module):
         )
         
     def forward(self, front, top):
-        f_map = self.backbone.forward_features(front)
-        t_map = self.backbone.forward_features(top)
+        # 🚨 [수정 2] 순수 Feature Vector 추출 (B, dim)
+        f_feat = self.backbone(front)
+        t_feat = self.backbone(top)
         
-        if f_map.shape[-1] == self.feat_dim:
-            f_map = f_map.permute(0, 3, 1, 2)
-            t_map = t_map.permute(0, 3, 1, 2)
-            
-        f_map = self.safe_pool(f_map)
-        t_map = self.safe_pool(t_map)
+        # Interaction (원소별 곱)
+        interaction = f_feat * t_feat
         
-        f_seq = f_map.flatten(2).transpose(1, 2)
-        t_seq = t_map.flatten(2).transpose(1, 2)
-        
-        attn_out, _ = self.cross_attn(query=f_seq, key=t_seq, value=t_seq)
-        
-        f_pooled = f_seq.mean(dim=1)
-        t_pooled = t_seq.mean(dim=1)
-        attn_pooled = attn_out.mean(dim=1)
-        
-        combined = torch.cat([f_pooled, t_pooled, attn_pooled], dim=1)
+        # Concat 후 분류
+        combined = torch.cat([f_feat, t_feat, interaction], dim=1)
         return self.classifier(combined).squeeze(1)
 
-def mixup_data(front, top, y, alpha=CFG.MIXUP_ALPHA):
-    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1
-    index = torch.randperm(front.size(0)).to(CFG.DEVICE)
-    mixed_front = lam * front + (1 - lam) * front[index, :]
-    mixed_top = lam * top + (1 - lam) * top[index, :]
-    return mixed_front, mixed_top, y, y[index], lam
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-
+# ==============================================================================
+# 5. K-Fold 학습 루프 (순수 BCE Loss, Mixup 제거)
+# ==============================================================================
 def train_and_evaluate():
     train_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'train.csv'))
     dev_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'dev.csv'))
@@ -214,22 +197,16 @@ def train_and_evaluate():
         trn_df = all_df[all_df['fold'] != fold].reset_index(drop=True)
         val_df = all_df[all_df['fold'] == fold].reset_index(drop=True)
         
-        num_stable = len(trn_df[trn_df['label'] == 'stable'])
-        num_unstable = len(trn_df[trn_df['label'] == 'unstable'])
-        
-        calc_pos_weight = min(num_unstable / (num_stable + 1e-6), 3.0) 
-        pos_weight = torch.tensor([calc_pos_weight], dtype=torch.float32).to(CFG.DEVICE)
-        print(f"[*] Clamped pos_weight for BCE: {calc_pos_weight:.4f}")
-        
         train_loader = DataLoader(StructureDataset(trn_df, is_train=True), batch_size=CFG.BATCH_SIZE, shuffle=True, 
                                   num_workers=2, pin_memory=True, persistent_workers=True, drop_last=True)
         val_loader = DataLoader(StructureDataset(val_df, is_train=False), batch_size=CFG.BATCH_SIZE, shuffle=False, 
                                 num_workers=2, pin_memory=True, persistent_workers=True)
         
-        model = BulletproofCrossAttentionNet().to(CFG.DEVICE)
+        model = RobustFusionNet().to(CFG.DEVICE)
         ema_model = ModelEmaV2(model, decay=CFG.EMA_DECAY)
         
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        # 🚨 [수정 3] pos_weight 완벽 제거! 순수한 확률 모델링(Calibration)을 위한 기본 BCE
+        criterion = nn.BCEWithLogitsLoss()
         
         base_optimizer = torch.optim.AdamW
         optimizer = SAM(model.parameters(), base_optimizer, lr=CFG.MAX_LR, weight_decay=CFG.WEIGHT_DECAY, rho=CFG.SAM_RHO)
@@ -245,24 +222,21 @@ def train_and_evaluate():
             train_loss = 0.0
             pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{CFG.EPOCHS} [Train]')
             
-            allow_mixup = (epoch < CFG.MIXUP_CUTOFF_EPOCH)
-            
             for front, top, labels in pbar:
                 front, top, labels = front.to(CFG.DEVICE, non_blocking=True), top.to(CFG.DEVICE, non_blocking=True), labels.to(CFG.DEVICE, non_blocking=True)
                 
-                use_mixup = allow_mixup and (np.random.rand() < CFG.MIXUP_PROB)
-                if use_mixup: front, top, y_a, y_b, lam = mixup_data(front, top, labels)
+                # 🚨 [수정 4] Mixup 제거. Mixup도 Soft Label을 만들어 LogLoss를 왜곡시킵니다.
                 
                 with torch.cuda.amp.autocast():
                     outputs = model(front, top)
-                    loss = mixup_criterion(criterion, outputs, y_a, y_b, lam) if use_mixup else criterion(outputs, labels)
+                    loss = criterion(outputs, labels)
                 
                 loss.backward()
                 optimizer.first_step(zero_grad=True)
                 
                 with torch.cuda.amp.autocast():
                     outputs_2 = model(front, top)
-                    loss_2 = mixup_criterion(criterion, outputs_2, y_a, y_b, lam) if use_mixup else criterion(outputs_2, labels)
+                    loss_2 = criterion(outputs_2, labels)
                 
                 loss_2.backward()
                 optimizer.second_step(zero_grad=True)
@@ -284,13 +258,16 @@ def train_and_evaluate():
             
             avg_train_loss = train_loss / len(train_loader)
             avg_val_loss = val_loss / len(val_loader)
-            print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} {'(No Mixup)' if not allow_mixup else ''}")
+            print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
             
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 torch.save(ema_model.module.state_dict(), f'best_model_fold{fold}.pth')
-                print(f" [NEW BEST] Fold {fold} Saved! Val Loss: {best_val_loss:.4f}")
+                print(f"🔥 [NEW BEST] Fold {fold} Saved! Val Loss: {best_val_loss:.4f}")
 
+# ==============================================================================
+# 6. Test 추론
+# ==============================================================================
 def inference_ensemble():
     test_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'sample_submission.csv'))
     test_df['source'] = 'test'
@@ -301,7 +278,7 @@ def inference_ensemble():
     ensemble_preds = np.zeros(len(test_df))
     
     for fold in range(CFG.NUM_FOLDS):
-        model = BulletproofCrossAttentionNet().to(CFG.DEVICE)
+        model = RobustFusionNet().to(CFG.DEVICE)
         model.load_state_dict(torch.load(f'best_model_fold{fold}.pth'))
         model.eval()
         
@@ -330,8 +307,8 @@ def inference_ensemble():
     submission = pd.read_csv(os.path.join(CFG.DATA_DIR, 'sample_submission.csv'))
     submission['unstable_prob'] = 1.0 - stable_probs
     submission['stable_prob'] = stable_probs
-    submission.to_csv('submission_v6_final.csv', index=False)
-    print("\n [FINAL] Saved as 'submission_v6_final.csv'")
+    submission.to_csv('submission_v7_baseline.csv', index=False)
+    print("\n🚀 [FINAL] Saved as 'submission_v7_baseline.csv'")
 
 if __name__ == '__main__':
     train_and_evaluate()
