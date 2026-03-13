@@ -21,7 +21,7 @@ class CFG:
     MODEL_NAME = 'tf_efficientnetv2_s.in21k_ft_in1k' 
     IMG_SIZE = 288
     BATCH_SIZE = 16
-    EPOCHS = 25
+    EPOCHS = 30
     MAX_LR = 2e-4
     WEIGHT_DECAY = 1e-2
     NUM_FOLDS = 5
