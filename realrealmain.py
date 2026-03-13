@@ -20,7 +20,7 @@ class CFG:
     DATA_DIR = './open'
     MODEL_NAME = 'convnext_small_in22ft1k' #convnext_small_in22ft1k!, tf_efficientnetv2_s.in21k_ft_in1k!, convnext_base_in22ft1k??, swinv2_tiny_window16_256!, maxvit_tiny_tf_224.in1k
     IMG_SIZE = 288
-    BATCH_SIZE = 64
+    BATCH_SIZE = 32
     EPOCHS = 60
     MAX_LR = 2e-4
     WEIGHT_DECAY = 1e-2
