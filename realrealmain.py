@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore')
 
 class CFG:
     DATA_DIR = './open'
-    MODEL_NAME = 'tf_efficientnetv2_s.in21k_ft_in1k' 
+    MODEL_NAME = 'convnext_base_in22ft1k' 
     IMG_SIZE = 288
     BATCH_SIZE = 16
     EPOCHS = 30
