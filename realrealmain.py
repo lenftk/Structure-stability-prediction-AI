@@ -16,15 +16,12 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# ==============================================================================
-# 1. 하이퍼파라미터 (기교 전부 제거, 순수 LogLoss 최적화)
-# ==============================================================================
 class CFG:
     DATA_DIR = './open'
-    MODEL_NAME = 'convnext_small_in22ft1k' 
+    MODEL_NAME = 'tf_efficientnetv2_s.in21k_ft_in1k' 
     IMG_SIZE = 288
     BATCH_SIZE = 16
-    EPOCHS = 30
+    EPOCHS = 25
     MAX_LR = 2e-4
     WEIGHT_DECAY = 1e-2
     NUM_FOLDS = 5
@@ -41,9 +38,6 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = True
 seed_everything(CFG.SEED)
 
-# ==============================================================================
-# 2. SAM Optimizer (유지: 도메인 일반화에 필수)
-# ==============================================================================
 class SAM(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer, rho=0.05, **kwargs):
         assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
@@ -79,9 +73,6 @@ class SAM(torch.optim.Optimizer):
         return torch.norm(
             torch.stack([p.grad.norm(p=2).to(shared_device) for group in self.param_groups for p in group["params"] if p.grad is not None]), p=2)
 
-# ==============================================================================
-# 3. 데이터셋 및 증강 (순수 물리 제약 증강 유지)
-# ==============================================================================
 front_transform = A.Compose([
     A.Resize(CFG.IMG_SIZE, CFG.IMG_SIZE),
     A.HorizontalFlip(p=0.5), 
@@ -134,24 +125,18 @@ class StructureDataset(Dataset):
             
         if self.is_test: return front_img, top_img, img_id
         else:
-            # 🚨 [수정 1] Label Smoothing 완벽 제거! LogLoss를 위해 순수 1.0과 0.0 부여
             label = 1.0 if row['label'] == 'stable' else 0.0
             return front_img, top_img, torch.tensor(label, dtype=torch.float32)
 
-# ==============================================================================
-# 4. 모델 설계 (강력하고 심플한 Late Fusion Baseline)
-# ==============================================================================
 class RobustFusionNet(nn.Module):
     def __init__(self, model_name=CFG.MODEL_NAME):
         super().__init__()
-        # Cross Attention 제거. 기본 Global Average Pooling(num_classes=0) 사용
         self.backbone = timm.create_model(model_name, pretrained=True, num_classes=0)
         
         with torch.no_grad():
             dummy = torch.randn(1, 3, CFG.IMG_SIZE, CFG.IMG_SIZE)
             feat_dim = self.backbone(dummy).shape[1]
             
-        # (Front, Top, Front*Top) 3가지 조합 -> 차원 3배
         self.classifier = nn.Sequential(
             nn.Dropout(0.3),
             nn.Linear(feat_dim * 3, 512),
@@ -162,20 +147,14 @@ class RobustFusionNet(nn.Module):
         )
         
     def forward(self, front, top):
-        # 🚨 [수정 2] 순수 Feature Vector 추출 (B, dim)
         f_feat = self.backbone(front)
         t_feat = self.backbone(top)
         
-        # Interaction (원소별 곱)
         interaction = f_feat * t_feat
         
-        # Concat 후 분류
         combined = torch.cat([f_feat, t_feat, interaction], dim=1)
         return self.classifier(combined).squeeze(1)
 
-# ==============================================================================
-# 5. K-Fold 학습 루프 (순수 BCE Loss, Mixup 제거)
-# ==============================================================================
 def train_and_evaluate():
     train_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'train.csv'))
     dev_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'dev.csv'))
@@ -205,7 +184,6 @@ def train_and_evaluate():
         model = RobustFusionNet().to(CFG.DEVICE)
         ema_model = ModelEmaV2(model, decay=CFG.EMA_DECAY)
         
-        # 🚨 [수정 3] pos_weight 완벽 제거! 순수한 확률 모델링(Calibration)을 위한 기본 BCE
         criterion = nn.BCEWithLogitsLoss()
         
         base_optimizer = torch.optim.AdamW
@@ -224,8 +202,6 @@ def train_and_evaluate():
             
             for front, top, labels in pbar:
                 front, top, labels = front.to(CFG.DEVICE, non_blocking=True), top.to(CFG.DEVICE, non_blocking=True), labels.to(CFG.DEVICE, non_blocking=True)
-                
-                # 🚨 [수정 4] Mixup 제거. Mixup도 Soft Label을 만들어 LogLoss를 왜곡시킵니다.
                 
                 with torch.cuda.amp.autocast():
                     outputs = model(front, top)
@@ -265,9 +241,6 @@ def train_and_evaluate():
                 torch.save(ema_model.module.state_dict(), f'best_model_fold{fold}.pth')
                 print(f"🔥 [NEW BEST] Fold {fold} Saved! Val Loss: {best_val_loss:.4f}")
 
-# ==============================================================================
-# 6. Test 추론
-# ==============================================================================
 def inference_ensemble():
     test_df = pd.read_csv(os.path.join(CFG.DATA_DIR, 'sample_submission.csv'))
     test_df['source'] = 'test'
