@@ -27,7 +27,7 @@ class CFG:
     NUM_FOLDS = 5
     EMA_DECAY = 0.999
     SAM_RHO = 0.05
-    SEED = 2026
+    SEED = 777
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def seed_everything(seed):
